@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 import uvicorn
 import secrets
 import httpx
@@ -10,7 +10,6 @@ app = FastAPI()
 BASE_URL = os.environ.get("BASE_URL", "https://yargi-mcp-oauth.onrender.com")
 UPSTREAM_MCP = "https://yargimcp.fastmcp.app/mcp"
 
-# OAuth Discovery
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_metadata():
     return JSONResponse({
@@ -30,7 +29,6 @@ async def protected_resource():
         "bearer_methods_supported": ["header"]
     })
 
-# OAuth Authorize — anında code üretir, gerçek login yok
 @app.get("/authorize")
 async def authorize(
     response_type: str = "code",
@@ -46,7 +44,6 @@ async def authorize(
         url=f"{redirect_uri}{separator}code={code}&state={state}"
     )
 
-# OAuth Token — her code için geçerli token üretir
 @app.post("/token")
 async def token(request: Request):
     return JSONResponse({
@@ -55,35 +52,51 @@ async def token(request: Request):
         "expires_in": 86400
     })
 
-# MCP Proxy — Yargı MCP'ye yönlendirir
-@app.api_route("/mcp", methods=["GET", "POST", "DELETE"])
-@app.api_route("/mcp/{path:path}", methods=["GET", "POST", "DELETE"])
+@app.api_route("/mcp", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
+@app.api_route("/mcp/{path:path}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
 async def mcp_proxy(request: Request, path: str = ""):
-    url = UPSTREAM_MCP
-    if path:
-        url = f"{UPSTREAM_MCP}/{path}"
+    url = f"{UPSTREAM_MCP}/{path}" if path else UPSTREAM_MCP
     
     body = await request.body()
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ["host", "authorization", "content-length"]
-    }
-    headers["accept"] = "application/json, text/event-stream"
     
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(
-            method=request.method,
-            url=url,
-            content=body,
-            headers=headers,
-            params=dict(request.query_params)
-        )
+    headers = {}
+    for k, v in request.headers.items():
+        if k.lower() not in ["host", "authorization", "content-length", "transfer-encoding"]:
+            headers[k] = v
     
-    return JSONResponse(
-        content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {},
-        status_code=resp.status_code,
-        headers={"content-type": resp.headers.get("content-type", "application/json")}
-    )
+    accept = request.headers.get("accept", "")
+    is_sse = "text/event-stream" in accept
+    
+    try:
+        if is_sse:
+            async def stream():
+                async with httpx.AsyncClient(timeout=60) as client:
+                    async with client.stream(
+                        method=request.method,
+                        url=url,
+                        content=body,
+                        headers=headers,
+                        params=dict(request.query_params)
+                    ) as resp:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.request(
+                    method=request.method,
+                    url=url,
+                    content=body,
+                    headers=headers,
+                    params=dict(request.query_params)
+                )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json")
+            )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
